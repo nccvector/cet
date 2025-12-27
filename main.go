@@ -74,7 +74,7 @@ func highlight(code, language string) string {
 	}
 	lexer = chroma.Coalesce(lexer)
 
-	style := styles.Get("monokai")
+	style := styles.Get("gruvbox")
 	if style == nil {
 		style = styles.Fallback
 	}
