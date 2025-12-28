@@ -9,22 +9,47 @@ cet -args="-O ReleaseFast -target aarch64-macos -mcpu=apple_m4" src/main.zig
 
 ![screenshot](./image.png)
 
-## Future Plans
+## Multi-File Projects
 
-### Multi-File Project Support
+Multi-file compilation is supported. Use the `-root` flag to set the project root directory:
 
-The Compiler Explorer API supports multi-file compilation via a `files` array parameter:
+```sh
+# Project where main.zig imports "src/utils.zig"
+cet -root=. main.zig
 
-```json
-{
-  "source": "<main file content>",
-  "files": [
-    {"filename": "header.hpp", "contents": "..."},
-    {"filename": "utils.cpp", "contents": "..."}
-  ],
-  "options": { ... }
-}
+# Compiling from a subdirectory
+cet -root=/path/to/project src/main.zig
 ```
+
+All source files matching the main file's extension are automatically collected and sent to Compiler Explorer.
+
+## Limitations
+
+### Module Aliasing Not Supported
+
+Zig's build system allows renaming modules via `build.zig`:
+
+```zig
+// build.zig
+const mod = b.addModule("hello", .{
+    .root_source_file = b.path("src/root.zig"),
+});
+```
+
+This lets code import by module name rather than path:
+
+```zig
+// main.zig
+const hello = @import("hello");  // Works with `zig build`
+```
+
+**This tool cannot resolve aliased imports.** Since Godbolt doesn't execute `build.zig`, it has no way to know that `"hello"` maps to `src/root.zig`.
+
+**Workarounds:**
+- Use path-based imports: `@import("src/root.zig")` instead of `@import("hello")`
+- Keep exploration code in a single file
+
+## Future Plans
 
 ### CMake Support
 
@@ -49,7 +74,5 @@ A dedicated CMake endpoint exists at `POST /api/compiler/<compiler-id>/cmake`:
 
 ### Implementation Tasks
 
-- Add `files` field to `CompileRequest` struct
-- Watch a directory instead of a single file
 - For CMake projects: use the `/cmake` endpoint with `CMakeLists.txt` as the source
 - Collect all `.cpp`, `.hpp`, `.h` files in the project directory
