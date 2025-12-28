@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -20,9 +21,17 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// The Godbolt API accepts: "files": [{"filename": "helper.zig", "contents": "..."}]
+
+type FileEntry struct {
+	Filename string `json:"filename"`
+	Contents string `json:"contents"`
+}
+
 type CompileRequest struct {
 	Source  string         `json:"source"`
 	Options CompileOptions `json:"options"`
+	Files   []FileEntry    `json:"files,omitempty"`
 }
 
 type CompileOptions struct {
@@ -65,6 +74,56 @@ func clearScreen() {
 	cmd := exec.Command("clear")
 	cmd.Stdout = os.Stdout
 	cmd.Run()
+}
+
+// collectProjectFiles gathers all source files from a directory for multi-file compilation
+// searchDir: where to search for files (the -root flag or main file's directory)
+// mainFile: the main source file (absolute path)
+// relativeToDir: paths in output will be relative to this directory (usually main file's directory)
+func collectProjectFiles(searchDir string, mainFile string, relativeToDir string) ([]FileEntry, error) {
+	ext := filepath.Ext(mainFile)
+	var files []FileEntry
+
+	skipDirs := map[string]bool{
+		".zig-cache": true, ".git": true, ".idea": true,
+		"node_modules": true, "target": true, "zig-out": true,
+	}
+
+	err := filepath.WalkDir(searchDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		if filepath.Ext(path) != ext || path == mainFile || d.Name() == "build.zig" {
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		// Make path relative to the main file's directory (how Zig resolves imports)
+		relPath, err := filepath.Rel(relativeToDir, path)
+		if err != nil {
+			return err
+		}
+
+		files = append(files, FileEntry{
+			Filename: relPath,
+			Contents: string(content),
+		})
+		return nil
+	})
+
+	return files, err
 }
 
 func highlight(code, language string) string {
@@ -117,7 +176,7 @@ func getLangFromFile(filePath string) string {
 	}
 }
 
-func compile(baseURL, compiler, filePath, args string, showSource bool) error {
+func compile(baseURL, compiler, filePath, args string, showSource bool, projectRoot string) error {
 	source, err := os.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %w", err)
@@ -130,8 +189,34 @@ func compile(baseURL, compiler, filePath, args string, showSource bool) error {
 		fmt.Println(highlight(string(source), lang))
 	}
 
+	// Collect additional project files for multi-file compilation
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+	mainDir := filepath.Dir(absPath)
+
+	// Determine search directory: use -root flag if provided, otherwise use main file's directory
+	var searchDir string
+	if projectRoot != "" {
+		searchDir, err = filepath.Abs(projectRoot)
+		if err != nil {
+			return fmt.Errorf("failed to get absolute project root: %w", err)
+		}
+	} else {
+		searchDir = mainDir
+	}
+
+	// Search from searchDir, but paths are relative to mainDir (how Zig resolves @import)
+	projectFiles, err := collectProjectFiles(searchDir, absPath, mainDir)
+	if err != nil {
+		fmt.Printf("\033[33mWarning: could not collect project files: %v\033[0m\n", err)
+		projectFiles = nil // Continue with just the main file
+	}
+
 	req := CompileRequest{
 		Source: string(source),
+		Files:  projectFiles,
 		Options: CompileOptions{
 			UserArguments: args,
 			Filters: Filters{
@@ -201,7 +286,7 @@ func compile(baseURL, compiler, filePath, args string, showSource bool) error {
 	return nil
 }
 
-func watch(baseURL, compiler, filePath, args string, showSource bool) error {
+func watch(baseURL, compiler, filePath, args string, showSource bool, projectRoot string) error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("failed to create watcher: %w", err)
@@ -224,7 +309,7 @@ func watch(baseURL, compiler, filePath, args string, showSource bool) error {
 	fmt.Printf("\033[34m   Server: %s\033[0m\n\n", baseURL)
 
 	// Initial compile
-	if err := compile(baseURL, compiler, filePath, args, showSource); err != nil {
+	if err := compile(baseURL, compiler, filePath, args, showSource, projectRoot); err != nil {
 		fmt.Printf("\033[31mError: %v\033[0m\n", err)
 	}
 
@@ -244,7 +329,7 @@ func watch(baseURL, compiler, filePath, args string, showSource bool) error {
 				debounce = time.AfterFunc(100*time.Millisecond, func() {
 					clearScreen()
 					fmt.Printf("\033[34m⚡ %s — %s\033[0m\n\n", filePath, time.Now().Format("15:04:05"))
-					if err := compile(baseURL, compiler, filePath, args, showSource); err != nil {
+					if err := compile(baseURL, compiler, filePath, args, showSource, projectRoot); err != nil {
 						fmt.Printf("\033[31mError: %v\033[0m\n", err)
 					}
 				})
@@ -260,11 +345,12 @@ func watch(baseURL, compiler, filePath, args string, showSource bool) error {
 
 func main() {
 	var (
-		server     = flag.String("server", "https://godbolt.org", "Compiler Explorer server URL")
-		compiler   = flag.String("compiler", "ztrunk", "Compiler ID (e.g., ztrunk, z0140, g141, clang1910)")
-		args       = flag.String("args", "", "Compiler arguments (e.g., '-O ReleaseFast -target aarch64-macos')")
-		once       = flag.Bool("once", false, "Compile once and exit (don't watch)")
-		showSource = flag.Bool("source", false, "Show highlighted source code")
+		server      = flag.String("server", "https://godbolt.org", "Compiler Explorer server URL")
+		compiler    = flag.String("compiler", "ztrunk", "Compiler ID (e.g., ztrunk, z0140, g141, clang1910)")
+		args        = flag.String("args", "", "Compiler arguments (e.g., '-O ReleaseFast -target aarch64-macos')")
+		once        = flag.Bool("once", false, "Compile once and exit (don't watch)")
+		showSource  = flag.Bool("source", false, "Show highlighted source code")
+		projectRoot = flag.String("root", "", "Project root for multi-file imports (default: file's directory)")
 	)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "cet - Compiler Explorer Terminal\n\n")
@@ -275,6 +361,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  cet -args='-O ReleaseFast -target aarch64-macos -mcpu=apple_m4' main.zig\n")
 		fmt.Fprintf(os.Stderr, "  cet -compiler=g132 -args='-O3' main.c\n")
 		fmt.Fprintf(os.Stderr, "  cet -once -source main.zig\n")
+		fmt.Fprintf(os.Stderr, "  cet -root=. src/main.zig   # Multi-file project with imports from repo root\n")
 	}
 	flag.Parse()
 
@@ -291,14 +378,14 @@ func main() {
 	}
 
 	if *once {
-		if err := compile(*server, *compiler, filePath, *args, *showSource); err != nil {
+		if err := compile(*server, *compiler, filePath, *args, *showSource, *projectRoot); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	if err := watch(*server, *compiler, filePath, *args, *showSource); err != nil {
+	if err := watch(*server, *compiler, filePath, *args, *showSource, *projectRoot); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
